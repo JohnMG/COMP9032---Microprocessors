@@ -1,0 +1,1396 @@
+;Program Description: Helicopter Simulation. Helicopter can travel between 1-4ms in a room that is 50x50x10
+;Author: John Massy-Greene
+;Date: 29/10/2015
+.include "m2560def.inc"
+
+
+.def xposL = r2
+.def xposH = r3
+.def yposL = r4
+.def yposH = r5 ;6 Registers used for holding the x,y,z position to the closest millimeter of
+.def zposL = r6 ;the helicopter in the room
+.def zposH = r7
+;Directions 'H'=Still 'U'=Up 'D'=Down 'F'=Forward 'B'=Back 'L'=Left 'R'=Right
+.def direction = r8 ;Direction and Speed Registers
+.def speed = r9
+.def speedchanges = r10 ;A register that tells the program whether the user wants to increase/decrease the speed of the helicopter
+
+;Fine helicontrol is used as a control structure within the program to hold the state of the helicopter. Depending on the state
+;of the helicopter certain actions can or cannot be taken. The bits of the register are use in the following way
+;Bit 0 = Take off(1) and landing(0). Bit 1 = Hover check(1=Hover 0=Resume Speed). 
+;Bit 2 = Crashed(0=No 1=Yes). Bit 3=Initial Take Off Bit 4 = Landed
+
+.def finehelicontrol = r11
+.def update = r12 ;Update is used by the timer to communicate with the main function that the display needs to be refreshed
+.def LEDS = r13   ;LEDS is used to flash the LEDs on and off in case the helicopter crashes
+
+;Two registers used for counting when a second has occurred. 1000 interrupts = 1 second
+;This is used to tell the total time the helicopter has flown
+.def thouL = r14
+.def thouH = r15
+
+.def temp1=r16
+.def temp2=r17
+.def temp3=r18
+;data is the main register used to communicate with LCD screen
+.def data=r19
+;r20-23 is exclusively used by the keypad
+.def rmask=r20
+.def cmask=r21
+.def row=r22
+.def col=r23
+;counting registers
+.def countL = r24
+.def countH = r25
+
+.equ takeoffFlip = 0b00000001
+.equ hoverFlip = 0b00000010
+.equ startHeliFlip = 0b00001000
+.equ crashFlip = 0b00000100
+.equ landingFlip = 0b00010000
+;speed mask is used by speed increase buttons to tell by the state of the helicopter
+;whether it is allowed to change the speed
+.equ SPEEDIGNOREMASK = 0b00001001
+;Move ignore mask is used by Timer 0 to see if the helicopter should be moved
+;This is dependend on the state of the helicopter
+.equ MOVEIGNOREMASK = 0b00001001
+
+.equ DELAY_1MS = 3996 ;The amount neeeded to delay 1ms
+.equ LCD_BF = 7
+.equ LCD_RS = 7  ;CONTROL PINS for port A and LCD
+.equ LCD_E = 6
+.equ LCD_RW = 5
+.equ LCD_BE = 4
+.equ initFuncSet = 0b00110000
+.equ actFuncSet = 0b00111100  ;Custom Function set. 8 bits of data. 2 line display. 5x10 characters
+.equ displayOff = 0b00001000
+.equ clearDisplay = 0b00000001     ;LCD commands sections
+.equ initEntryMode = 0b00000110
+.equ initDisplay = 0b00001111
+.equ returnHome = 0b00000010
+
+.equ L1posLCD = 0x00 ;Positions on the LCD Display to display the information about the helicopter
+.equ L1dirLCD = 0x09
+.equ L1spdLCD = 0x0D
+.equ L2posLCD = 0x40
+.equ L2dirLCD = 0x4A
+.equ L2spdLCD = 0x4D
+
+.equ motor0 = 0x00 ;5 Different motor speeds. Ranging from not moving at all to 
+.equ motor1 = 0x40 ;full speed
+.equ motor2 = 0x80
+.equ motor3 = 0xC0
+.equ motor4 = 0xFF
+.equ INTMASK = 0xFF
+
+.equ PORTCDIR = 0xF0   ;Masks and PORT directions for the keypad
+.equ INITCOLMASK = 0xEF
+.equ INITROWMASK = 0x01
+.equ ROWMASK = 0x0F
+
+.equ halfsec = 500 ;500 interrupts = 0.5 seconds. Required for waiting for speed changes
+.equ fullCount = 1000 ;1000 milliseconds to a second
+
+.macro waitNano
+	rcall sleep_1ms
+.endmacro
+
+.macro waitFour
+	rcall sleep_1ms
+	rcall sleep_1ms
+	rcall sleep_1ms   ;Nano, Four and Fiften are used for the LCD initialisation
+	rcall sleep_1ms
+	rcall sleep_1ms
+.endmacro
+
+.macro waitFifteen
+	rcall sleep_1ms
+	rcall sleep_1ms
+	rcall sleep_1ms
+	rcall sleep_1ms
+	rcall sleep_1ms
+	rcall sleep_1ms
+	rcall sleep_1ms
+	rcall sleep_1ms
+	rcall sleep_1ms
+	rcall sleep_1ms
+	rcall sleep_1ms
+	rcall sleep_1ms
+	rcall sleep_1ms
+	rcall sleep_1ms
+	rcall sleep_1ms
+.endmacro
+
+.macro lcd_write ;write either a command or data to the LCD
+	out PORTF,data
+	out PORTA,@0
+	nop
+	sbi PORTA,LCD_E
+	nop
+	nop
+	nop
+	cbi PORTA,LCD_E
+	nop
+	nop
+	nop
+.endmacro
+
+.macro lcd_write_data
+	ldi temp1,(1<<LCD_RS)|(0<<LCD_RW)  ;using the generic write macro, write data 
+	lcd_write temp1
+.endmacro
+
+.macro lcd_write_com
+	ldi temp1,(0<<LCD_RS)|(0<<LCD_RW) ;write commands using the write macro
+	lcd_write temp1
+.endmacro
+
+.macro lcd_next_line
+	ldi data,secondLine  ;go to the next line on the screen
+	lcd_write_com2
+.endmacro
+
+.macro lcd_clear_home
+	ldi data,clearDisplay ;Clear the display and return to the upper left corner
+	lcd_write_com2
+.endmacro
+
+.macro lcd_write_data2
+	lcd_wait_busy
+	lcd_write_data
+.endmacro
+
+;Two macros that are used to write data or commands after the initalisation
+;Each makes sure the LCD isn't busy before writing
+
+.macro lcd_write_com2
+	lcd_wait_busy
+	lcd_write_com
+.endmacro
+
+;waits until the LCD isn't busy
+.macro lcd_wait_busy
+	clr temp1
+	out DDRF,temp1
+	out PORTF,temp1
+	ldi temp1,(1<<LCD_RW)
+	out PORTA,temp1
+
+busy_loop:
+	rcall sleep_1ms
+	sbi PORTA,LCD_E
+	rcall sleep_1ms
+	in temp1,PINF
+	cbi PORTA,LCD_E
+	sbrc temp1,LCD_BF
+	rjmp busy_loop
+
+	clr temp1
+	out PORTA,temp1
+	ser temp1
+	out DDRF,temp1
+.endmacro
+
+;Sets address of the next character to be written to the LCD screen
+;Used for accurate and fast placement
+.macro lcd_set_address
+	ldi data,(1<<7)|@0
+	lcd_write_com2
+.endmacro
+
+;All positions and movement are tracked within millimeters. This is a macro used by the LCD
+;screen to convert the x,y and z positions into meters and find each digit within the number
+;and conver that digit into an ascii value for the LCD
+.macro calculate_position
+	mov countL,@0
+	mov countH,@1
+	ldi temp1,low(10000)
+	ldi temp2,high(10000)
+	clr data
+
+xyztenloop:
+	cp countL,temp1
+	cpc countH,temp2
+	brlo xyzone
+	inc data
+	sub countL,temp1
+	sbc countH,temp2
+	rjmp xyztenloop
+
+xyzone:
+	ldi temp2,'0'
+	add data,temp2
+	lcd_write_data2
+	clr data
+	ldi temp1,low(1000)
+	ldi temp2,high(1000)
+
+xyzoneloop:
+	cp countL,temp1
+	cpc countH,temp2
+	brlo endxyzpos
+	inc data
+	sub countL,temp1
+	sbc countH,temp2
+	rjmp xyzoneloop
+
+endxyzpos:
+	ldi temp2,'0'
+	add data,temp2
+	lcd_write_data2
+
+.endmacro
+
+;Macro for changing the value of the PWM signal of timer 5
+;which controls the motor
+.macro changeMotSpeed
+	ldi temp1,@0
+	sts OCR5AL,temp1
+	clr temp1
+	sts OCR5AH,temp1
+.endmacro
+
+;clear a value in data memory
+.macro clearhalfsec
+	ldi temp1,0
+	st y,temp1
+	st -y,temp1
+.endmacro
+
+;debouncing for the keypad
+.macro lowStatus
+	loop:
+		in temp1, PINC			;read PORTC from I/O device
+		andi temp1, ROWMASK		;get the keypad output value
+		cpi temp1, 0xF			;check status of the row, OxF: low
+		brne loop									
+.endmacro
+
+;Macro for adding the current speed to the distance to get the location
+;of the helicopter. Also adds a check to make sure the helicopter hasn't crashed
+.macro addPosition
+	mov temp1,speed
+	ldi temp2,0
+	movw countH:countL,@0:@1
+	add countL,temp1
+	adc countH,temp2
+	movw @0:@1,countH:countL
+	ldi temp1,low(50000)
+	ldi temp2,high(50000)
+	cp temp1,@1
+	cpc temp2,@0
+	brsh endaddPosition
+	movw @0:@1,temp2:temp1
+	ldi temp2,crashFlip
+	eor finehelicontrol,temp2
+endaddPosition:
+.endmacro
+
+;Z position is essentially the same as the x and y positions
+;however its maximum value is 10meters
+.macro addZPosition
+	mov temp1,speed
+	ldi temp2,0
+	movw countH:countL,zposH:zposL
+	add countL,temp1
+	adc countH,temp2
+	movw zposH:zposL,countH:countL
+	ldi temp1,low(10000)
+	ldi temp2,high(10000)
+	cp temp1,countL
+	cpc temp2,countH
+	brsh endaddZPosition
+	movw zposH:zposL,temp2:temp1
+	ldi temp2,crashFlip
+	eor finehelicontrol,temp2
+endaddZPosition:
+.endmacro
+
+;Going left or back in the y and z positions involves subtracting
+;position with the previous distance and speed
+.macro subPosition
+	mov temp1,speed
+	ldi temp2,0
+	movw countH:countL,@0:@1
+	cp temp1,countL
+	cpc temp2,countH
+	brsh subcrash
+	sub countL,temp1
+	sbc countH,temp2
+	movw @0:@1,countH:countL
+	rjmp endsubPosition
+subcrash:
+	ldi temp2,crashFlip
+	eor finehelicontrol,temp2
+	ldi countL,0
+	ldi countH,0
+	movw @0:@1,countH:countL
+endsubPosition:
+.endmacro
+
+;Going down in the helicopter means that once you reach the ground
+;you don't crash but you are actually landing
+.macro subZPosition
+	mov temp1,speed
+	ldi temp2,0
+	movw countH:countL,zposH:zposL
+	cp temp1,countL
+	cpc temp2,countH
+	brsh goodLanding
+	sub countL,temp1
+	sbc countH,temp2
+	movw zposH:zposL,countH:countL
+	rjmp endsubZPosition
+goodLanding:
+	ldi temp2,landingFlip
+	eor finehelicontrol,temp2
+	ldi countL,0
+	ldi countH,0
+	movw zposH:zposL,countH:countL
+endsubZPosition:
+.endmacro
+
+;Printing function for a successful landing. This macro is used
+;to repeat code for printing the total speed and distance of the helicopter
+;This macro allow can print the up to a maximum of 9999 seconds or meters
+.macro printDT
+	ld countL,y+
+	ld countH,y
+	ldi temp1,low(1000)
+	ldi temp2,high(1000)
+	clr data
+
+dtthouloop:
+	cp countL,temp1
+	cpc countH,temp2
+	brlo dthun
+	inc data
+	sub countL,temp1
+	sbc countH,temp2
+	rjmp dtthouloop
+
+dthun:
+	ldi temp2,'0'
+	add data,temp2
+	lcd_write_data2
+	clr data
+	ldi temp1,100
+	ldi temp2,0
+
+dthunloop:
+	cp countL,temp1
+	cpc countH,temp2
+	brlo dtten
+	inc data
+	sub countL,temp1
+	sbc countH,temp2
+	rjmp dthunloop
+
+dtten:
+	ldi temp2,'0'
+	add data,temp2
+	lcd_write_data2
+	clr data
+	ldi temp1,10
+
+dttenloop:
+	cp countL,temp1
+	brlo dtone
+	inc data
+	sub countL,temp1
+	rjmp dttenloop
+
+dtone:
+	add data,temp2
+	lcd_write_data2
+	clr data
+
+enddtcalc:
+	mov data,countL
+	add data,temp2
+	lcd_write_data2
+
+.endmacro
+
+
+.dseg
+.org 0x0200
+speedwait: .db 2
+.org 0x0204
+totaltime: .db 2 ;variables in data memory used to hold the value of half a second(for speed changing wait)
+.org 0x0208      ;total run time and distance of the helicopter and the distance in mm of the helicopter
+dm: .db 2
+.org 0x020C
+dt: .db 2
+
+.cseg
+.org 0x0000
+rjmp RESET
+nop
+rjmp IRQ0     ;Reset, Interrupt 1,2 and Timer 0 interrupt vector placement
+nop
+rjmp IRQ1
+nop
+.org OVF0addr
+rjmp TIMER0_INT
+nop
+
+
+
+RESET:
+	ser temp1
+	out DDRF,temp1   ;PORT A is the control port for the LCD
+	out DDRA,temp1	 ;PORT F is the data port for the LCD
+	clr temp1
+	out PORTF,temp1
+	out PORTA,temp1
+
+	ser temp1
+	sts DDRK,temp1
+	clr temp1
+	sts PORTK,temp1
+
+	ldi temp1,PORTCDIR
+	out DDRC,temp1
+
+	ldi temp1, 0b11111100 ;Setting up of PORT D for input and allowing of interrupts
+	out DDRD,temp1
+	out PORTD,temp1
+
+	ldi temp1,(0<<ISC00)|(0<<ISC10) ;Both interrupts are set for low level. This was used to help in
+	sts EICRA,temp1                 ;the debouncing of the buttons
+	
+	in temp1,EIMSK
+	ori temp1,(1<<INT0)|(1<<INT1)   ;Activate the buttons
+	out EIMSK,temp1
+
+	ldi temp1,0b00001000 ;Activate the output compare pin of timer 5
+	sts DDRL,temp1
+
+	ldi temp1,motor0 ;Set up the PWM to run the motor
+	sts OCR5AL,temp1
+	clr temp1
+	sts OCR5AH,temp1
+
+	ldi temp1,(1<<CS52) ;Prescale value of 256 for Timer 5. Due to the pecularities of the motor
+	sts TCCR5B,temp1    ;this is the only value that seems to give consitent results
+	ldi temp1,(1<<WGM50)|(1<<COM5A1)
+	sts TCCR5A,temp1
+
+	ldi temp1,0b00000000
+	out TCCR0A,temp1
+	ldi temp1,0b00000011 ;Set up timer 0 to 64. This means it interrupts every 1024 microseconds
+	out TCCR0B,temp1     ;Conveniently this is ~1ms. Every 1000 interrupts is 1second. Since the helicopter
+	                     ;speed and distance in meters which is 1000 millimeters. The helicopter can effectively
+						 ;have its position and speed measured in millimeters/milliseconds. However conversion
+	waitFifteen          ;is required when printing to the LCD screen
+
+	ldi data,initFuncSet
+	lcd_write_com
+	
+	waitFour
+	ldi data,initFuncSet ;Initialisation section for the LCD
+	lcd_write_com
+	
+	waitNano
+	ldi data,initFuncSet
+	lcd_write_com
+
+	lcd_wait_busy
+	ldi data,actFuncSet
+	lcd_write_com
+
+	lcd_wait_busy
+	ldi data,displayOff
+	lcd_write_com
+
+	lcd_wait_busy
+	ldi data,clearDisplay
+	lcd_write_com
+
+	lcd_wait_busy
+	ldi data,initEntryMode
+	lcd_write_com
+
+	lcd_wait_busy
+	ldi data,initDisplay
+	lcd_write_com
+	lcd_wait_busy
+
+;Clear the display for a fresh takeoff
+	ldi data,clearDisplay
+	lcd_write_com2
+
+
+	ldi temp1,low(25000)
+	ldi temp2,high(25000)
+	mov xposL,temp1
+	mov xposH,temp2
+	mov yposL,temp1       ;Set up the helicopter in the middle of the room on the floor
+	mov yposH,temp2
+	clr temp1
+	mov zposL,temp1
+	mov zposH,temp1
+	ldi temp1,'H'        ;Helicopter direction is Still and the speed is 0
+	mov direction,temp1
+	clr speed
+	clr speedchanges
+	clr finehelicontrol
+	clr LEDS
+	
+	rcall write_start   ;Write the starting message to the screen
+	clr data
+	clr update
+
+	rjmp main
+
+IRQ0:
+	push temp1
+	in temp1,SREG
+	push temp1
+	push temp2
+	push r28
+	push r29
+;If the state of the helicopter is crashed/landed/landing/hasn't initially taken off/is in hover mode
+;Don't increase the speed of the helicopter 
+	mov temp1,finehelicontrol
+	cpi temp1,SPEEDIGNOREMASK
+	brne IRQ0DelayEnd
+
+	mov temp1,speedchanges
+	mov temp2,speed
+
+	cpi temp2,4
+	breq IRQ0DelayEnd ;If the helicopter is at maxspeed then don't allow the user to increase any further
+	cpi temp1,0
+	brne IRQ0DelayEnd ;If the user is already trying to change the speed, then stop
+
+	ldi temp1,1	
+	mov speedchanges,temp1
+
+IRQ0DelayEnd:
+;debouncing code for the helicopter. While the helicopter is still on a low level, wait before exiting.
+	rcall sleep_1ms
+	in temp1,PIND
+	andi temp1,INTMASK
+	cpi temp1,INTMASK
+	brne IRQ0DelayEnd
+
+	pop r29
+	pop r28
+	pop temp2
+	pop temp1
+	out SREG,temp1
+	pop temp1
+	reti
+
+IRQ1:
+	push temp1
+	in temp1,SREG
+	push temp1
+	push temp2
+	push r28
+	push r29
+;Same conditions for increasing the speed of the helicopter exist are in place for decreasing the speed
+	mov temp1,finehelicontrol
+	cpi temp1,SPEEDIGNOREMASK
+	brne IRQ1DelayEnd
+
+	mov temp1,speedchanges
+	mov temp2,speed
+
+	cpi temp2,1
+	breq IRQ1DelayEnd
+	cpi temp1,0
+	brne IRQ1DelayEnd
+	
+	ldi temp1,-1
+	mov speedchanges,temp1
+
+IRQ1DelayEnd:
+	rcall sleep_1ms
+	in temp1,PIND
+	andi temp1,INTMASK
+	cpi temp1,INTMASK
+	brne IRQ0DelayEnd
+
+	pop r29
+	pop r28
+	pop temp2
+	pop temp1
+	out SREG,temp1
+	pop temp1
+	reti
+
+;Timer 0 Interrupt routine. This code is used for timing the position/distance/time of the helicopter
+;Also serves the function of waiting 0.5seconds before changing the speed and flashing of the LEDS when
+;the helicopter crashes
+TIMER0_INT:
+	push temp1
+	in temp1, SREG
+	push temp1
+	push temp2
+	push temp3
+	push countL
+	push countH
+	 	
+	mov temp1,speedchanges
+	cpi temp1,0
+	breq timerEnd
+	
+	ldi r28,low(speedwait)
+	ldi r29,high(speedwait)
+	ld countL,y+
+	ld countH,y
+	adiw countH:countL,1
+	ldi temp1,low(halfsec)
+	ldi temp2,high(halfsec)
+	cp countL,temp1
+	cpc countH,temp2
+	brne noChange
+
+;if the helicopter has crashed then don't update the position and don't update the speed
+;but rather flash the LEDS
+	clearhalfsec
+	sbrs finehelicontrol,2
+	rcall dospeedupdate
+	sbrc finehelicontrol,2
+	rjmp flashLED
+	rjmp timerEnd
+	
+noChange:
+	st y,countH
+	st -y,countL
+	rjmp timerEnd
+
+flashLED:
+	com LEDS
+	sts PORTK,LEDS
+
+;If the helicopter is hovering,hasn't taken off or is landed then don't change the position of the helicopter
+timerEnd:
+	rcall addtotaltime
+	mov temp1,finehelicontrol
+	ori temp1,MOVEIGNOREMASK
+	cpi temp1,MOVEIGNOREMASK
+	brne actualEnd
+	rcall findposition
+	rcall addtotaldistance
+
+actualEnd:
+;tell the main program to update the LCD with the possible new position/speed/direction of the helicopter
+	inc update
+
+	pop countH
+	pop countL
+	pop temp3
+	pop temp2
+	pop temp1
+	out SREG,temp1
+	pop temp1
+	reti
+
+
+main:
+;if the helicopter has landed then jump to code for landing procedures
+	sbrc finehelicontrol,4
+	rjmp goodFlight
+;if the helicopter has crashed then jump to the code for crash procedures
+	sbrc finehelicontrol,2
+	rjmp crashProtocol
+;keep checking the keypad for when the user wants to control the direction/takeoff/landing/hover modes of the helicopter
+	rcall keypadcheck
+	mov temp1,update
+	cpi temp1,0
+	brne LCDSTUFF
+	rjmp main
+
+LCDSTUFF:
+	rcall update_LCD
+	rjmp main
+
+;When the helicopter has landed. Turn of the motor and the timer and print the total distance and
+;time of the helicopter
+goodFlight:
+	changeMotSpeed motor0
+	ldi temp1,(0<<TOIE0)
+	sts TIMSK0,temp1
+	rcall printstats
+	rjmp halt
+
+;When the helicopter has crashed. Turn off the motor and display the last known location/direction/speed if the helicopter 
+crashProtocol:
+	changeMotSpeed motor0
+	inc speedchanges
+	rcall update_LCD
+	rjmp halt
+
+halt:
+	rjmp halt
+	
+
+
+;Function to display information about the helicopter on the LCD
+update_LCD:
+	push r28
+	push r29
+	push temp1
+	push temp2
+	push countL
+	push countH
+
+;Display the x y and z coordinates of the helicopter
+	lcd_set_address L2posLCD
+	calculate_position xposL,xposH
+	ldi data,','
+	lcd_write_data2
+	calculate_position yposL,yposH
+	ldi data,','
+	lcd_write_data2
+	calculate_position zposL,zposH
+	
+;display the direction of the helicopter. However if its in however mode, override the the actual direction
+;with the symbol for hovering
+	lcd_set_address L2dirLCD
+	mov data,direction
+	sbrc finehelicontrol,1
+	ldi data,'H'
+	lcd_write_data2
+	
+;display the speed of the helicopter in meters per second
+	lcd_set_address L2spdLCD
+	ldi temp2,'0'
+	mov data,speed
+	add data,temp2
+	lcd_write_data2
+	ldi data,'m'
+	lcd_write_data2
+	ldi data,'s'
+	lcd_write_data2	
+;let the main function know that updating the LCD has been completed
+	clr update
+	pop countL
+	pop countH
+	pop temp2
+	pop temp1
+	pop r29
+	pop r28
+	ret
+;Sleep 1 millisecond function is used by the LCD/debouncing buttons and keypad to obtain
+;correct timing
+sleep_1ms:
+	push countL
+	push countH
+	ldi countH, high(DELAY_1MS)
+	ldi countL, low(DELAY_1MS)
+delayloop_1ms:
+	sbiw countH:countL, 1
+	brne delayloop_1ms
+	pop countH
+	pop countL
+	ret
+;-----------------------------------------------------
+;Function used by Timer 0 to decrease or increase the speed of the helicopter
+;and change the speed of the motor
+dospeedupdate:
+	push r28
+	push r29
+	push temp1
+	push temp2
+
+;speedchanges holds a value that is -1 or 1 that is set by either PB0 or PB1
+;add this value to the current speed
+	mov temp2,speedchanges
+	add temp2,speed
+
+	cpi temp2,5
+	breq dospeedupdateend
+	cpi temp2,0
+	breq dospeedupdateend
+	
+	cpi temp2,1
+	breq toMotOne
+	
+	cpi temp2,2
+	breq toMotTwo
+	
+	cpi temp2,3
+	breq toMotThree
+	
+	cpi temp2,4
+	breq toMotFour
+;Depending on the new speed of the helicopter change the motor speed accordingly
+toMotOne:
+	changeMotSpeed motor1
+	rjmp changed
+
+toMotTwo:
+	changeMotSpeed motor2
+	rjmp changed
+
+toMotThree:
+	changeMotSpeed motor3
+	rjmp changed
+
+toMotFour:
+	changeMotSpeed motor4
+	rjmp changed
+
+changed:
+	mov speed,temp2
+
+dospeedupdateend:
+;clear the value in speed changes so the user can change the speed again
+	clr speedchanges
+
+	pop temp2
+	pop temp1
+	pop r29
+	pop r28
+	
+	ret
+
+;-----------------------------------------------------------
+
+keypadcheck:
+	push r28
+	push r29
+	push temp1
+	push temp2
+	push temp3
+
+mainkey:
+	ldi cmask, INITCOLMASK	; initial column mask
+	clr	col
+							; initial column
+colloop:
+	cpi col, 4
+	breq convert
+	out	PORTC, cmask		; set column to mask value (one column off)
+	ldi temp1, 0xFF
+delay:
+	dec temp1
+	brne delay
+
+	in	temp1, PINC				; read PORTD
+	andi temp1, ROWMASK
+	cpi temp1, 0xF				; check if any rows are on
+	breq nextcol
+								; if yes, find which row is on
+	ldi rmask, INITROWMASK		; initialise row check
+	clr	row						; initial row
+rowloop:
+	cpi row, 4
+	breq nextcol
+	mov temp2, temp1
+	and temp2, rmask				; check masked bit
+	breq convert 				; if bit is clear, convert the bitcode
+	inc row						; else move to the next row
+	lsl rmask					; shift the mask to the next bit
+	jmp rowloop
+
+nextcol:
+	lsl cmask					; else get new mask by shifting and
+	inc cmask
+	inc col						; increment column value
+	jmp colloop					; and check the next column
+
+convert:				
+	cpi row,3					; if row is 3 the user wants to either take off/land/hover/disable hover
+	breq helicontrol
+	cpi col,3
+	breq ender
+	cpi col,4
+	breq ender
+	
+;if the helicopter has crashed/landed/hasn't taken off/is hovering then ignore attempts to change
+;the direction
+	mov temp1,finehelicontrol	
+	cpi temp1,SPEEDIGNOREMASK
+	brne ender
+
+	mov temp1, row				; otherwise we have a number in 1-9
+	add temp1, row
+	add temp1, row				; temp1 = row * 3
+	add temp1, col				; add the column address to get the value
+	inc temp1
+	rjmp numbers
+
+;1 = Up 2= Forward 3= Down 4 = Left 6 = Right 8 = Back
+numbers:
+	cpi temp1,1
+	breq upDir
+	cpi temp1,2
+	breq forwardDir
+	cpi temp1,3
+	breq downDir
+	cpi temp1,4
+	breq leftDir
+	cpi temp1,6
+	breq rightDir
+	cpi temp1,8
+	breq backDir
+	rjmp ender
+
+upDir:
+	ldi temp2,'U'
+	mov direction,temp2
+	rjmp ender
+downDir:
+	ldi temp2,'D'
+	mov direction,temp2
+	rjmp ender
+forwardDir:
+	ldi temp2,'F'
+	mov direction,temp2
+	rjmp ender
+backDir:
+	ldi temp2,'B'
+	mov direction,temp2
+	rjmp ender
+leftDir:
+	ldi temp2,'L'
+	mov direction,temp2
+	rjmp ender
+rightDir:
+	ldi temp2,'R'
+	mov direction,temp2
+	rjmp ender
+;* is used for take off or landing
+;# is used for hovering 
+helicontrol:
+	cpi col,2
+	breq takeoffland
+	cpi col,0
+	breq hover
+	rjmp ender
+
+takeoffland:
+	rcall takeoffOrLand
+	rjmp ender
+hover:
+	sbrs finehelicontrol,3
+	rjmp ender
+	ldi temp1,hoverFlip
+	eor finehelicontrol,temp1
+
+ender:
+;debounce the keypad
+	lowStatus
+	
+	pop temp3
+	pop temp2
+	pop temp1
+	pop r29
+	pop r28
+	ret
+
+;------------------------------------------------------------------------------
+;Depending on the direction of the helicopter add to or subtract from the x,y or z coordinates
+findPosition:
+	push r28
+	push r29
+	push temp1
+	push temp2
+	push countL
+	push countH
+
+	mov temp1,direction	
+	cpi temp1,'U'
+	breq goUp
+	cpi temp1,'D'
+	breq goDown
+	cpi temp1,'F'
+	breq goForward
+	cpi temp1,'B'
+	breq goBack
+	ldi temp2,'R'
+	cpse temp1,temp2   ;Due to the lengthy code to detect crashes the code for left and right positions
+	rjmp lefty         ;is different to requiring the command rjmp because breq conditional has a limited range
+	rjmp goRight       ;to where it can jump to in code
+lefty:
+	ldi temp2,'L'
+	cpse temp1,temp2
+	rjmp endPosition
+	rjmp goLeft
+
+goUp:
+	addZPosition
+	rjmp endPosition
+goDown:
+	subZPosition
+	rjmp endPosition
+goForward:
+	addPosition yposH,yposL
+	rjmp endPosition
+goBack:
+	subPosition yposH,yposL
+	rjmp endPosition
+goRight:
+	addPosition xposH,xposL
+	rjmp endPosition
+goLeft:
+	subPosition xposH,xposL
+	rjmp endPosition
+
+endPosition:
+	pop countH
+	pop countL
+	pop temp2
+	pop temp1
+	pop r29
+	pop r28
+	ret
+
+;--------------------------------------------------------------------------------------
+takeoffOrLand:
+	push r28
+	push r29
+	push temp1
+	push temp2
+
+	sbrc finehelicontrol,1 ;If the helicoper is hovering. Ignore take off/land commands
+	rjmp TLend
+	sbrc finehelicontrol,2 ;Ignore user input if the helicopter has crashed
+	rjmp TLend
+	sbrc finehelicontrol,4 ;Ignore user input if the helicopter has landed
+	rjmp TLend
+
+;If helicopter is set to landing mode switch to take off mode
+	sbrs finehelicontrol,0
+	rjmp goToTakeoff
+;set the direction to down and the speed to one. Also update the motor and flip the take off bit in the finehelicontrol register
+	ldi temp1,'D'
+	mov direction,temp1
+	ldi temp1,1
+	mov speed,temp1
+	changeMotSpeed motor1
+	ldi temp1,takeoffFlip
+	eor finehelicontrol,temp1
+	rjmp TLend
+
+;In take off mode set the direction to up and the speed to 2. And flip the take off bit in finehelicontrol to tell the program
+;the helicopter has taken off
+goToTakeoff:
+	ldi temp1,'U'
+	mov direction,temp1
+	ldi temp1, 2
+	mov speed, temp1
+	;ldi temp1, clearHover ;If the helicopter is hovering. Then make sure it isn't hovering anymore
+	;and finehelicontrol,temp1
+	ldi temp1,takeoffFlip
+	eor finehelicontrol,temp1
+	sbrc finehelicontrol,3 ;Determine if the helicopter has actually taken off for the first time
+	rjmp TLend
+
+;If the helicopter is just starting to take off. Then initialise the screen
+	ldi data,clearDisplay
+	lcd_write_com2
+	rcall write_line_one
+	rcall update_LCD
+	ldi temp1,startheliflip
+	eor finehelicontrol,temp1
+	
+	ldi temp1,(1<<TOIE0)
+	sts TIMSK0,temp1
+	changeMotSpeed motor2
+	sei
+
+TLend:
+	pop temp2
+	pop temp1
+	pop r29
+	pop r28
+	ret
+
+;Write the first line of the LCD screen which tells the user what the data on the screen means
+write_line_one:
+	push r28
+	push r29
+	push temp1
+	push data
+;POS = Position of the helicopter in terms of the x,y,z coordinates of the room
+	lcd_set_address L1posLCD
+	ldi data, 'P'
+	lcd_write_data2
+	ldi data, 'O'
+	lcd_write_data2
+	ldi data, 'S'
+	lcd_write_data2
+;DIR = Direction the helicopter is heading
+	lcd_set_address L1dirLCD
+	ldi data, 'D'
+	lcd_write_data2
+	ldi data, 'I'
+	lcd_write_data2
+	ldi data, 'R'
+	lcd_write_data2
+;SPD = Speed of the helicopter in meters per second
+	lcd_set_address L1spdLCD
+	ldi data, 'S'
+	lcd_write_data2
+	ldi data, 'P'
+	lcd_write_data2
+	ldi data, 'D'
+	lcd_write_data2
+;set the address to the second line
+	lcd_set_address L2posLCD
+
+write_one_end:
+	pop data
+	pop temp1
+	pop r29
+	pop r28
+	ret
+
+;write the first message to the screen before the helicopter has taken off
+write_start:
+	push r28
+	push r29
+	push temp1
+	push temp2
+	push data
+
+	ldi data,'S'
+	lcd_write_data2
+	ldi data,'T'
+	lcd_write_data2
+	ldi data,'A'
+	lcd_write_data2
+	ldi data,'R'
+	lcd_write_data2
+	ldi data,'T'
+	lcd_write_data2
+	ldi data,':'
+	lcd_write_data2
+
+	pop data
+	pop temp2
+	pop temp1
+	pop r29
+	pop r28
+	ret
+
+;When landing total time is displayed in seconds. Timer0 interrupts is 1024 microseconds.
+;Count a 1000 of these and store the value in ThouL and ThouH. When thouH:thouL reaches 1000
+;A second has occurred, so add one to the total time and append this value to totaltime which
+;is in data memory
+addtotaltime:
+	push r28
+	push r29
+	push temp1
+	push temp2
+	push countL
+	push countH
+	
+	ldi temp1,1
+	ldi temp2,0
+	add thouL,temp1
+	adc thouH,temp2
+
+	ldi temp1,low(fullCount)
+	ldi temp2,high(fullCount)
+	cp thouL,temp1
+	cpc thouH,temp2
+	brlo endtotaltime
+
+	ldi r28,low(totalTime)
+	ldi r29,high(totalTime)
+	ld countL,y+
+	ld countH,y
+	adiw countH:countL,1
+	st y,countH
+	st -y,countL
+	clr thouL
+	clr thouH
+
+endtotaltime:
+	pop countH
+	pop countL
+	pop temp2
+	pop temp1
+	pop r29
+	pop r28
+	ret
+
+;total distance works much the same way as total time with two exceptions:
+;Exception 1: since all registers are in use, total distance is paired with
+;the data memory value dm. dm stores the distance travelled in millimeters.
+;every 1000 millimeters is a meter. So append a meter to total distance(dt) and
+;clear the dm variable
+;Exception 2: Total time is constantly updated as long as the helicopter hasn't landed
+;crashed. Distance is variably updated and is dependent upon how fast the helicopter is travelling
+;As well as not hovering
+addtotaldistance:
+	push r28
+	push r29
+	push temp1
+	push temp2
+	push countL
+	push countH
+
+	mov temp1,speed
+	ldi temp2,0
+	ldi r28,low(dm)
+	ldi r29,high(dm)
+	ld countL,y+
+	ld countH,y
+	
+	add countL,temp1
+	adc countH,temp2
+	ldi temp1,low(1000)
+	ldi temp2,high(1000)
+	cp countL,temp1
+	cpc countH,temp2
+	brlo notameter
+	clr temp1
+	st y,temp1
+	st -y,temp1
+	rcall addmeter
+	rjmp endoftotaldistance
+
+notameter:
+	st y,countH
+	st -y,countL
+
+endoftotaldistance:
+	pop countH
+	pop countL
+	pop temp2
+	pop temp1
+	pop r29
+	pop r28
+	ret
+;Add a meter function which is used by addtotaldistance function
+;It's a short amount of code for a function but its necessary
+;to make sure the Y register doesn't have conflicts when addressing
+;different data memory variables
+addmeter:
+	push r28
+	push r29
+	push countH
+	push countL
+
+	ldi r28,low(dt)
+	ldi r29,high(dt)
+	ld countL,y+
+	ld countH,y
+	adiw countH:countL,1
+	st y,countH
+	st -y,countL
+
+	pop countL
+	pop countH
+	pop r29
+	pop r28
+	ret
+
+;When the helicopter has succesfully landed. Print the total time the helicopter was running
+;and the total distance it travelled around the room
+printstats:
+	push r28
+	push r29
+	push temp1
+	push temp2
+;Distance of the flight is displayed on line one
+	ldi data,clearDisplay
+	lcd_write_com2
+	ldi data,'D'
+	lcd_write_data2
+	ldi data,'I'
+	lcd_write_data2
+	ldi data,'S'
+	lcd_write_data2
+	ldi data,'T'
+	lcd_write_data2
+	ldi data,'A'
+	lcd_write_data2
+	ldi data,'N'
+	lcd_write_data2
+	ldi data,'C'
+	lcd_write_data2
+	ldi data,'E'
+	lcd_write_data2
+	ldi data,':'
+	lcd_write_data2
+;access the total distance from the variable in data memory
+	rcall print_total_distance
+	ldi data,'m'
+	lcd_write_data2
+
+	lcd_set_address L2posLCD
+;Duration of the flight is displayed on line two
+	ldi data,'D'
+	lcd_write_data2
+	ldi data,'U'
+	lcd_write_data2
+	ldi data,'R'
+	lcd_write_data2
+	ldi data,'A'
+	lcd_write_data2
+	ldi data,'T'
+	lcd_write_data2
+	ldi data,'I'
+	lcd_write_data2
+	ldi data,'O'
+	lcd_write_data2
+	ldi data,'N'
+	lcd_write_data2
+	ldi data,':'
+	lcd_write_data2
+;access the total time from the variable in data memory
+	rcall print_total_time
+	ldi data,'s'
+	lcd_write_data2
+	
+	pop temp2
+	pop temp1
+	pop r29
+	pop r28
+	ret
+
+
+;Function to access the variable of total distance in data memory
+;and the manipulate the data so it can be printed cleanly to the screen
+print_total_distance:
+	push r28
+	push r29
+	push temp1
+	push temp2
+	push countL
+	push countH
+
+	ldi r28,low(dt)
+	ldi r29,high(dt)
+	printDT
+
+	pop countH
+	pop countL
+	pop temp2
+	pop temp1
+	pop r29
+	pop r28
+	ret
+
+;Function to access the variable of total time the helicopter was flying
+;and manipulate the data so it can be printed cleanly to the screen
+print_total_time:
+	push r28
+	push r29
+	push temp1
+	push temp2
+	push countL
+	push countH
+
+	ldi r28,low(totaltime)
+	ldi r29,high(totaltime)
+	printDT
+
+
+	pop countH
+	pop countL
+	pop temp2
+	pop temp1
+	pop r29
+	pop r28
+	ret
